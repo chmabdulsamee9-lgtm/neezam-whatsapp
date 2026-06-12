@@ -25,7 +25,6 @@ const SESSIONS_DIR = path.join(__dirname, "sessions");
 
 if (!fs.existsSync(SESSIONS_DIR)) fs.mkdirSync(SESSIONS_DIR, { recursive: true });
 
-// Minimal silent logger so Baileys doesn't flood stdout
 const silentLogger = {
   level: "silent",
   trace: () => {}, debug: () => {}, info: () => {},
@@ -33,7 +32,6 @@ const silentLogger = {
   child: function () { return this; },
 };
 
-// clients: Map<clientId, { sock, status, qrDataUrl, shouldReconnect }>
 const clients = new Map();
 
 async function startClient(clientId) {
@@ -46,7 +44,7 @@ async function startClient(clientId) {
   try {
     ({ version } = await fetchLatestBaileysVersion());
   } catch {
-    version = [2, 3000, 1019291584]; // fallback version
+    version = [2, 3000, 1019291584];
   }
 
   const sock = makeWASocket({
@@ -56,7 +54,6 @@ async function startClient(clientId) {
     logger: silentLogger,
   });
 
-  // Upsert the client entry
   const existing = clients.get(clientId) || {};
   existing.sock = sock;
   existing.status = "connecting";
@@ -92,7 +89,15 @@ async function startClient(clientId) {
 
       if (client) client.status = "disconnected";
 
-      if (!loggedOut && client?.shouldReconnect) {
+      if (loggedOut) {
+        const sessionDir = path.join(SESSIONS_DIR, clientId);
+        if (fs.existsSync(sessionDir)) {
+          fs.rmSync(sessionDir, { recursive: true, force: true });
+          console.log(`[${clientId}] Session deleted — restarting fresh in 3s...`);
+        }
+        clients.delete(clientId);
+        setTimeout(() => startClient(clientId).catch(console.error), 3000);
+      } else if (client?.shouldReconnect) {
         console.log(`[${clientId}] Reconnecting in 3s...`);
         setTimeout(() => startClient(clientId).catch(console.error), 3000);
       } else {
@@ -102,9 +107,6 @@ async function startClient(clientId) {
   });
 }
 
-// ─── Routes ─────────────────────────────────────────────────────────────────
-
-// GET /qr/:clientId — start session, return QR dataURL or {status:'connected'}
 app.get("/qr/:clientId", async (req, res) => {
   const { clientId } = req.params;
   const existing = clients.get(clientId);
@@ -113,12 +115,10 @@ app.get("/qr/:clientId", async (req, res) => {
     return res.json({ status: "connected" });
   }
 
-  // Start a new session if none is running
   if (!existing || existing.status === "disconnected") {
     startClient(clientId).catch(console.error);
   }
 
-  // Poll up to 10 seconds for QR or connected state
   for (let i = 0; i < 20; i++) {
     await new Promise((r) => setTimeout(r, 500));
     const c = clients.get(clientId);
@@ -129,7 +129,6 @@ app.get("/qr/:clientId", async (req, res) => {
   res.json({ status: "pending", message: "QR not ready yet — try again in a moment" });
 });
 
-// POST /request-code — { clientId, phoneNumber } — phone number pairing
 app.post("/request-code", async (req, res) => {
   const { clientId, phoneNumber } = req.body || {};
   if (!clientId || !phoneNumber) {
@@ -138,11 +137,9 @@ app.post("/request-code", async (req, res) => {
 
   const digits = phoneNumber.replace(/[^0-9]/g, "");
 
-  // Start session if not already running
   let client = clients.get(clientId);
   if (!client || client.status === "disconnected") {
     await startClient(clientId);
-    // Wait for socket to be ready (up to 8s)
     for (let i = 0; i < 16; i++) {
       await new Promise((r) => setTimeout(r, 500));
       client = clients.get(clientId);
@@ -169,7 +166,6 @@ app.post("/request-code", async (req, res) => {
   }
 });
 
-// POST /send — { clientId, phone, message }
 app.post("/send", async (req, res) => {
   const { clientId, phone, message } = req.body || {};
   if (!clientId || !phone || !message) {
@@ -194,7 +190,6 @@ app.post("/send", async (req, res) => {
   }
 });
 
-// GET /status/:clientId
 app.get("/status/:clientId", (req, res) => {
   const { clientId } = req.params;
   const client = clients.get(clientId);
@@ -202,7 +197,6 @@ app.get("/status/:clientId", (req, res) => {
   res.json({ status: client.status, clientId });
 });
 
-// POST /disconnect/:clientId — logout and delete session
 app.post("/disconnect/:clientId", async (req, res) => {
   const { clientId } = req.params;
   const client = clients.get(clientId);
@@ -214,7 +208,7 @@ app.post("/disconnect/:clientId", async (req, res) => {
   try {
     await client.sock.logout();
   } catch {
-    // logout may throw if already disconnected; that's fine
+    // already disconnected
   }
 
   const sessionDir = path.join(SESSIONS_DIR, clientId);
@@ -226,8 +220,6 @@ app.post("/disconnect/:clientId", async (req, res) => {
   console.log(`[${clientId}] Logged out and session deleted`);
   res.json({ success: true, clientId });
 });
-
-// ─── Start ───────────────────────────────────────────────────────────────────
 
 app.listen(PORT, () => {
   console.log(`WhatsApp multi-client server running on port ${PORT}`);
