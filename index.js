@@ -57,9 +57,6 @@ async function startClient(clientId) {
     markOnlineOnConnect: false,
     connectTimeoutMs: 60000,
     keepAliveIntervalMs: 30000,
-    retryRequestDelayMs: 2000,
-    fireInitQueries: false,
-    generateHighQualityLinkPreview: false,
   });
 
   const existing = clients.get(clientId) || {};
