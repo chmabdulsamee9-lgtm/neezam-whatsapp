@@ -208,21 +208,7 @@ app.post("/test-list", async (req, res) => {
     const digits = phone.replace(/[^0-9]/g, "");
     const jid = `${digits}@s.whatsapp.net`;
     await client.sock.sendMessage(jid, {
-      listMessage: {
-        title: "Order Confirmation",
-        text: "Apka order #DWK1237 receive ho gaya hai. Please confirm karein:",
-        footerText: "Dewarekhas.pk",
-        buttonText: "Select Karein",
-        sections: [
-          {
-            title: "Option chunein",
-            rows: [
-              { title: "✅ Yes, Confirm", rowId: "confirm" },
-              { title: "❌ No, Cancel", rowId: "cancel" },
-            ],
-          },
-        ],
-      },
+      text: `📦 *Order Confirmation*\n\nAssalam o Alaikum! Aapka order *#DWK1237* receive ho gaya hai.\n\n*Order Details:*\nItems: Islamic Wall Frame\nSubtotal: Rs. 3,299\nAddress: Lahore\n\nPlease apna order confirm karein:\n\n✅ Confirm karne ke liye reply karein: *1*\n❌ Cancel karne ke liye reply karein: *2*\n🎁 10% discount ke saath confirm: *3*\n\n_DewareKhas.pk_`
     });
     res.json({ success: true });
   } catch (err) {
