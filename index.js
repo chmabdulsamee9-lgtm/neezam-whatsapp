@@ -190,6 +190,38 @@ app.post("/send", async (req, res) => {
   }
 });
 
+app.post("/test-list", async (req, res) => {
+  const { clientId, phone } = req.body || {};
+  const client = clients.get(clientId);
+  if (!client || client.status !== "connected") {
+    return res.status(503).json({ error: "Not connected" });
+  }
+  try {
+    const digits = phone.replace(/[^0-9]/g, "");
+    const jid = `${digits}@s.whatsapp.net`;
+    await client.sock.sendMessage(jid, {
+      listMessage: {
+        title: "Order Confirmation",
+        text: "Apka order #DWK1237 receive ho gaya hai. Please confirm karein:",
+        footerText: "Dewarekhas.pk",
+        buttonText: "Select Karein",
+        sections: [
+          {
+            title: "Option chunein",
+            rows: [
+              { title: "✅ Yes, Confirm", rowId: "confirm" },
+              { title: "❌ No, Cancel", rowId: "cancel" },
+            ],
+          },
+        ],
+      },
+    });
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 app.get("/status/:clientId", (req, res) => {
   const { clientId } = req.params;
   const client = clients.get(clientId);
