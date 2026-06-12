@@ -53,6 +53,13 @@ async function startClient(clientId) {
     printQRInTerminal: false,
     logger: silentLogger,
     getMessage: async () => { return { conversation: '' }; },
+    syncFullHistory: false,
+    markOnlineOnConnect: false,
+    connectTimeoutMs: 60000,
+    keepAliveIntervalMs: 30000,
+    retryRequestDelayMs: 2000,
+    fireInitQueries: false,
+    generateHighQualityLinkPreview: false,
   });
 
   const existing = clients.get(clientId) || {};
@@ -94,13 +101,13 @@ async function startClient(clientId) {
         const sessionDir = path.join(SESSIONS_DIR, clientId);
         if (fs.existsSync(sessionDir)) {
           fs.rmSync(sessionDir, { recursive: true, force: true });
-          console.log(`[${clientId}] Session deleted — restarting fresh in 10s...`);
+          console.log(`[${clientId}] Session deleted — restarting fresh in 15s...`);
         }
         clients.delete(clientId);
-        setTimeout(() => startClient(clientId).catch(console.error), 10000);
+        setTimeout(() => startClient(clientId).catch(console.error), 15000);
       } else if (client?.shouldReconnect) {
-        console.log(`[${clientId}] Reconnecting in 10s...`);
-        setTimeout(() => startClient(clientId).catch(console.error), 10000);
+        console.log(`[${clientId}] Reconnecting in 15s...`);
+        setTimeout(() => startClient(clientId).catch(console.error), 15000);
       } else {
         clients.delete(clientId);
       }
