@@ -129,6 +129,46 @@ app.get("/qr/:clientId", async (req, res) => {
   res.json({ status: "pending", message: "QR not ready yet — try again in a moment" });
 });
 
+// POST /request-code — { clientId, phoneNumber } — phone number pairing
+app.post("/request-code", async (req, res) => {
+  const { clientId, phoneNumber } = req.body || {};
+  if (!clientId || !phoneNumber) {
+    return res.status(400).json({ error: "clientId and phoneNumber are required" });
+  }
+
+  const digits = phoneNumber.replace(/[^0-9]/g, "");
+
+  // Start session if not already running
+  let client = clients.get(clientId);
+  if (!client || client.status === "disconnected") {
+    await startClient(clientId);
+    // Wait for socket to be ready (up to 8s)
+    for (let i = 0; i < 16; i++) {
+      await new Promise((r) => setTimeout(r, 500));
+      client = clients.get(clientId);
+      if (client?.sock) break;
+    }
+  }
+
+  client = clients.get(clientId);
+  if (!client?.sock) {
+    return res.status(503).json({ error: "Session could not be started" });
+  }
+
+  if (client.status === "connected") {
+    return res.json({ status: "connected" });
+  }
+
+  try {
+    const code = await client.sock.requestPairingCode(digits);
+    console.log(`[${clientId}] Pairing code for ${digits}: ${code}`);
+    res.json({ code });
+  } catch (err) {
+    console.error(`[${clientId}] requestPairingCode error:`, err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // POST /send — { clientId, phone, message }
 app.post("/send", async (req, res) => {
   const { clientId, phone, message } = req.body || {};
