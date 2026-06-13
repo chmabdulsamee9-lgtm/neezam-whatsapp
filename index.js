@@ -40,29 +40,32 @@ const clients = new Map();
 async function useSupabaseAuthState(clientId) {
   const writeData = async (key, data) => {
     const id = `${clientId}:${key}`;
-    await supabase.from("whatsapp_sessions").upsert({
+    const { error } = await supabase.from("whatsapp_sessions").upsert({
       id,
       client_id: clientId,
       key_name: key,
       data: JSON.parse(JSON.stringify(data, BufferJSON.replacer)),
       updated_at: new Date().toISOString(),
     });
+    if (error) console.error(`[${clientId}] Supabase WRITE ERROR (${key}):`, error.message);
   };
 
   const readData = async (key) => {
     const id = `${clientId}:${key}`;
-    const { data: row } = await supabase
+    const { data: row, error } = await supabase
       .from("whatsapp_sessions")
       .select("data")
       .eq("id", id)
       .maybeSingle();
+    if (error) console.error(`[${clientId}] Supabase READ ERROR (${key}):`, error.message);
     if (!row?.data) return null;
     return JSON.parse(JSON.stringify(row.data), BufferJSON.reviver);
   };
 
   const removeData = async (key) => {
     const id = `${clientId}:${key}`;
-    await supabase.from("whatsapp_sessions").delete().eq("id", id);
+    const { error } = await supabase.from("whatsapp_sessions").delete().eq("id", id);
+    if (error) console.error(`[${clientId}] Supabase DELETE ERROR (${key}):`, error.message);
   };
 
   const creds = (await readData("creds")) || initAuthCreds();
@@ -104,7 +107,8 @@ async function useSupabaseAuthState(clientId) {
 }
 
 async function deleteSession(clientId) {
-  await supabase.from("whatsapp_sessions").delete().eq("client_id", clientId);
+  const { error } = await supabase.from("whatsapp_sessions").delete().eq("client_id", clientId);
+  if (error) console.error(`[${clientId}] Supabase SESSION DELETE ERROR:`, error.message);
 }
 
 // ─── WhatsApp Client ────────────────────────────────────────────────────────
@@ -183,16 +187,22 @@ async function startClient(clientId) {
 // ─── Auto-restore sessions on server start ──────────────────────────────────
 
 async function restoreSessions() {
-  const { data } = await supabase
+  const { data, error } = await supabase
     .from("whatsapp_sessions")
     .select("client_id")
     .eq("key_name", "creds");
+  if (error) {
+    console.error("Restore sessions error:", error.message);
+    return;
+  }
   if (data?.length) {
     const ids = [...new Set(data.map(r => r.client_id))];
     console.log(`Restoring ${ids.length} session(s):`, ids);
     for (const id of ids) {
       startClient(id).catch(console.error);
     }
+  } else {
+    console.log("No saved sessions found in Supabase");
   }
 }
 
