@@ -45,13 +45,13 @@ async function useSupabaseAuthState(clientId) {
       data: JSON.parse(JSON.stringify(data, BufferJSON.replacer)),
       updated_at: new Date().toISOString(),
     });
-    if (error) console.error(`[${clientId}] Supabase WRITE ERROR (${key}):`, error.message);
+    if (error) console.error(`[${clientId}] WRITE ERROR (${key}):`, error.message);
   };
 
   const readData = async (key) => {
     const id = `${clientId}:${key}`;
     const { data: row, error } = await supabase.from("whatsapp_sessions").select("data").eq("id", id).maybeSingle();
-    if (error) console.error(`[${clientId}] Supabase READ ERROR (${key}):`, error.message);
+    if (error) console.error(`[${clientId}] READ ERROR (${key}):`, error.message);
     if (!row?.data) return null;
     return JSON.parse(JSON.stringify(row.data), BufferJSON.reviver);
   };
@@ -59,7 +59,7 @@ async function useSupabaseAuthState(clientId) {
   const removeData = async (key) => {
     const id = `${clientId}:${key}`;
     const { error } = await supabase.from("whatsapp_sessions").delete().eq("id", id);
-    if (error) console.error(`[${clientId}] Supabase DELETE ERROR (${key}):`, error.message);
+    if (error) console.error(`[${clientId}] DELETE ERROR (${key}):`, error.message);
   };
 
   const creds = (await readData("creds")) || initAuthCreds();
@@ -97,89 +97,60 @@ async function useSupabaseAuthState(clientId) {
 }
 
 async function deleteSession(clientId) {
-  const { error } = await supabase.from("whatsapp_sessions").delete().eq("client_id", clientId);
-  if (error) console.error(`[${clientId}] SESSION DELETE ERROR:`, error.message);
+  await supabase.from("whatsapp_sessions").delete().eq("client_id", clientId);
 }
 
-// ─── Order confirmation flow state ─────────────────────────────────────────
-// phone -> { orderId, orderNo, stage: 'confirm' | 'discount', clientId }
+// ─── Pending orders state ───────────────────────────────────────────────────
 const pendingOrders = new Map();
 
-// ─── Send order confirmation ────────────────────────────────────────────────
+// ─── Send confirmation message ──────────────────────────────────────────────
 
 async function sendOrderConfirmation(sock, jid, order) {
   const { orderNo, name, items, subtotal, address, city } = order;
-  try {
-    await sock.sendMessage(jid, {
-      listMessage: {
-        title: "📦 Order Confirmation",
-        text: `Thank you for your order from Dewarekhas.pk. This is a confirmation message.\n\nOrder Details:\n\nOrder Number: #${orderNo}\nItems: ${items}\nSubtotal: ${subtotal}\n\nAddress: ${address}\nCity: ${city}\n\nPlease confirm your order.`,
-        footerText: "DewareKhas.pk",
-        buttonText: "Select one",
-        sections: [{
-          rows: [
-            { title: "✅ Yes, Confirm ✅", rowId: "confirm" },
-            { title: "❌ No, Cancel ❌", rowId: "cancel" },
-          ]
-        }]
-      }
-    });
-  } catch (e) {
-    // listMessage failed — fallback to text + poll
-    console.log(`[listMessage failed] Falling back to poll`);
-    await sock.sendMessage(jid, {
-      text: `📦 *Order Confirmation*\n\nThank you for your order from *Dewarekhas.pk*.\n\nOrder Number: *#${orderNo}*\nItems: ${items}\nSubtotal: ${subtotal}\nAddress: ${address}, ${city}\n\nPlease confirm your order.`
-    });
-    await new Promise(r => setTimeout(r, 800));
-    await sock.sendMessage(jid, {
-      poll: {
-        name: "Please confirm your order:",
-        values: ["✅ Yes, Confirm ✅", "❌ No, Cancel ❌"],
-        selectableCount: 1,
-      }
-    });
-  }
+  const text = `📦 *Order Confirmation*\n\nThank you for your order from *Dewarekhas.pk*. This is a confirmation message.\n\nOrder Details:\n\nOrder Number: *#${orderNo}*\nItems: ${items}\nSubtotal: ${subtotal}\n\nAddress: ${address}\nCity: ${city}\n\nPlease confirm your order.`;
+
+  await sock.sendMessage(jid, {
+    poll: {
+      name: text,
+      values: ["✅ Yes, Confirm ✅", "❌ No, Cancel ❌"],
+      selectableCount: 1,
+    }
+  });
 }
 
 async function sendDiscountOffer(sock, jid, order) {
   const { orderNo, subtotal } = order;
   const discountedPrice = Math.round(Number(subtotal) * 0.9);
+  const discountAmount = Number(subtotal) - discountedPrice;
+  const text = `🎁 *Special Discount Offer!*\n\nAapka order cancel karne se pehle — hum aapko *10% discount* offer karte hain!\n\nOrder: *#${orderNo}*\nOriginal Price: Rs. ${subtotal}\nDiscount: Rs. ${discountAmount}\nDiscounted Price: *Rs. ${discountedPrice}*\n\nKya aap discount ke saath confirm karna chahte hain?`;
+
+  await sock.sendMessage(jid, {
+    poll: {
+      name: text,
+      values: ["✅ Yes, 10% Discount Ke Saath Confirm", "❌ No, Cancel Karo"],
+      selectableCount: 1,
+    }
+  });
+}
+
+// ─── Poll vote detection ────────────────────────────────────────────────────
+
+function getPollVote(msg) {
   try {
-    await sock.sendMessage(jid, {
-      listMessage: {
-        title: "🎁 Special Discount Offer!",
-        text: `Aapka order cancel karne se pehle — hum aapko *10% discount* offer karte hain!\n\nOrder: #${orderNo}\nOriginal Price: Rs. ${subtotal}\nDiscounted Price: *Rs. ${discountedPrice}*\n\nKya aap discount ke saath confirm karna chahte hain?`,
-        footerText: "DewareKhas.pk",
-        buttonText: "Select one",
-        sections: [{
-          rows: [
-            { title: "✅ Yes, 10% Discount Ke Saath Confirm", rowId: "discount_confirm" },
-            { title: "❌ No, Cancel Karo", rowId: "discount_cancel" },
-          ]
-        }]
-      }
-    });
-  } catch (e) {
-    await sock.sendMessage(jid, {
-      text: `🎁 *Special Discount Offer!*\n\nAapka order cancel karne se pehle — hum aapko *10% discount* offer karte hain!\n\nOrder: *#${orderNo}*\nOriginal Price: Rs. ${subtotal}\nDiscounted Price: *Rs. ${discountedPrice}*`
-    });
-    await new Promise(r => setTimeout(r, 800));
-    await sock.sendMessage(jid, {
-      poll: {
-        name: "Discount ke saath confirm karein?",
-        values: ["✅ Yes, 10% Discount Ke Saath Confirm", "❌ No, Cancel Karo"],
-        selectableCount: 1,
-      }
-    });
-  }
+    const pollUpdate = msg.message?.pollUpdateMessage;
+    if (!pollUpdate) return null;
+    const votes = pollUpdate.vote?.selectedOptions || [];
+    if (votes.length === 0) return null;
+    return votes[0]; // selected option name (hashed)
+  } catch { return null; }
 }
 
 // ─── WhatsApp Client ────────────────────────────────────────────────────────
 
 async function startClient(clientId) {
   const existing = clients.get(clientId);
-  if (existing?.starting) { console.log(`[${clientId}] Already starting — skip`); return; }
-  if (existing?.status === "connected") { console.log(`[${clientId}] Already connected — skip`); return; }
+  if (existing?.starting) return;
+  if (existing?.status === "connected") return;
   if (existing?.sock) { try { existing.sock.end(); } catch {} }
   if (existing?.reconnectTimer) { clearTimeout(existing.reconnectTimer); }
 
@@ -189,6 +160,8 @@ async function startClient(clientId) {
   entry.qrDataUrl = null;
   entry.shouldReconnect = true;
   entry.reconnectTimer = null;
+  // Store poll name->options map for decoding votes
+  entry.pollCache = entry.pollCache || new Map();
   clients.set(clientId, entry);
 
   try {
@@ -198,7 +171,12 @@ async function startClient(clientId) {
 
     const sock = makeWASocket({
       version, auth: state, printQRInTerminal: false, logger: silentLogger,
-      getMessage: async () => { return { conversation: '' }; },
+      getMessage: async (key) => {
+        // Return cached poll message for vote decryption
+        const cached = entry.pollCache?.get(key.id);
+        if (cached) return cached;
+        return { conversation: '' };
+      },
       syncFullHistory: false, markOnlineOnConnect: false,
       connectTimeoutMs: 60000, keepAliveIntervalMs: 30000,
     });
@@ -229,9 +207,7 @@ async function startClient(clientId) {
       if (connection === "close") {
         const code = lastDisconnect?.error?.output?.statusCode;
         const loggedOut = code === DisconnectReason.loggedOut;
-        console.log(`[${clientId}] Disconnected — code=${code} loggedOut=${loggedOut}`);
         if (client) client.status = "disconnected";
-
         if (loggedOut) {
           await deleteSession(clientId);
           clients.delete(clientId);
@@ -245,75 +221,83 @@ async function startClient(clientId) {
       }
     });
 
-    // ─── Incoming message handler ───────────────────────────────────────
+    // Cache sent poll messages for vote decryption
     sock.ev.on("messages.upsert", async ({ messages, type }) => {
-      if (type !== "notify") return;
       for (const msg of messages) {
+        // Cache our own poll messages
+        if (msg.key.fromMe && msg.message?.pollCreationMessage) {
+          entry.pollCache?.set(msg.key.id, msg.message);
+        }
+
+        if (type !== "notify") continue;
         if (msg.key.fromMe) continue;
+
         const jid = msg.key.remoteJid;
         const phone = jid.replace("@s.whatsapp.net", "");
-
-        // List response
-        const listReply = msg.message?.listResponseMessage?.singleSelectReply?.selectedRowId;
-        // Poll response
-        const pollVote = msg.message?.pollUpdateMessage;
-
-        const response = listReply || (pollVote ? "poll" : null);
         const pending = pendingOrders.get(phone);
-
         if (!pending || pending.clientId !== clientId) continue;
 
+        // Handle list response
+        const listReply = msg.message?.listResponseMessage?.singleSelectReply?.selectedRowId;
+
+        // Handle poll update — decode selected option
+        let pollChoice = null;
+        if (msg.message?.pollUpdateMessage) {
+          try {
+            const pollMsg = await sock.decryptPollVote(msg);
+            if (pollMsg?.selectedOptions?.length > 0) {
+              pollChoice = pollMsg.selectedOptions[0];
+              console.log(`[${clientId}] Poll vote from ${phone}: ${pollChoice}`);
+            }
+          } catch (e) {
+            console.error(`[${clientId}] Poll decrypt error:`, e.message);
+          }
+        }
+
+        const choice = listReply || pollChoice;
+        if (!choice) continue;
+
+        console.log(`[${clientId}] Response from ${phone}: ${choice} | stage: ${pending.stage}`);
+
         if (pending.stage === "confirm") {
-          if (listReply === "confirm") {
-            // Confirmed
+          if (choice.toLowerCase().includes("yes") || choice.toLowerCase().includes("confirm")) {
             pendingOrders.delete(phone);
             await sock.sendMessage(jid, {
-              text: `✅ *Shukriya!* Aapka order *#${pending.orderNo}* confirm ho gaya hai!\n\nHum jald hi aapka order dispatch karenge. 🚀\n\n_DewareKhas.pk_`
+              text: `✅ *Shukriya!* Aapka order *#${pending.orderNo}* confirm ho gaya hai!\n\nHum jald aapka order dispatch karenge. 🚀\n\n_DewareKhas.pk_`
             });
-            // Update Supabase
             await supabase.from("order_statuses").upsert(
               { order_id: String(pending.orderId), status: "Approved", updated_at: new Date().toISOString() },
               { onConflict: "order_id" }
             );
-            console.log(`[${clientId}] Order ${pending.orderNo} CONFIRMED`);
-          } else if (listReply === "cancel") {
-            // Offer discount
+            console.log(`[${clientId}] Order ${pending.orderNo} CONFIRMED ✅`);
+          } else if (choice.toLowerCase().includes("cancel") || choice.toLowerCase().includes("no")) {
             pending.stage = "discount";
             pendingOrders.set(phone, pending);
             await sendDiscountOffer(sock, jid, pending);
           }
         } else if (pending.stage === "discount") {
-          if (listReply === "discount_confirm") {
-            // Confirmed with discount
+          if (choice.toLowerCase().includes("yes") || choice.toLowerCase().includes("discount")) {
             pendingOrders.delete(phone);
             const discountedPrice = Math.round(Number(pending.subtotal) * 0.9);
             const discountAmount = Number(pending.subtotal) - discountedPrice;
             await sock.sendMessage(jid, {
               text: `🎉 *Zabardast!* Aapka order *#${pending.orderNo}* 10% discount ke saath confirm ho gaya!\n\nDiscount: Rs. ${discountAmount}\nFinal Price: *Rs. ${discountedPrice}*\n\nHum jald dispatch karenge! 🚀\n\n_DewareKhas.pk_`
             });
-            // Update Supabase — Approved + discount
             await supabase.from("order_statuses").upsert(
-              {
-                order_id: String(pending.orderId),
-                status: "Approved",
-                discount: String(discountAmount),
-                updated_at: new Date().toISOString()
-              },
+              { order_id: String(pending.orderId), status: "Approved", discount: String(discountAmount), updated_at: new Date().toISOString() },
               { onConflict: "order_id" }
             );
-            console.log(`[${clientId}] Order ${pending.orderNo} CONFIRMED with 10% discount`);
-          } else if (listReply === "discount_cancel") {
-            // Cancelled
+            console.log(`[${clientId}] Order ${pending.orderNo} CONFIRMED with discount ✅`);
+          } else {
             pendingOrders.delete(phone);
             await sock.sendMessage(jid, {
               text: `😔 Aapka order *#${pending.orderNo}* cancel ho gaya hai.\n\nAgar kabhi zaroorat ho to dobara order karein.\n\n_DewareKhas.pk_`
             });
-            // Update Supabase
             await supabase.from("order_statuses").upsert(
               { order_id: String(pending.orderId), status: "Cancelled", updated_at: new Date().toISOString() },
               { onConflict: "order_id" }
             );
-            console.log(`[${clientId}] Order ${pending.orderNo} CANCELLED`);
+            console.log(`[${clientId}] Order ${pending.orderNo} CANCELLED ❌`);
           }
         }
       }
@@ -327,14 +311,13 @@ async function startClient(clientId) {
   }
 }
 
-// ─── Auto-restore sessions ───────────────────────────────────────────────────
+// ─── Auto-restore ────────────────────────────────────────────────────────────
 
 async function restoreSessions() {
   const { data, error } = await supabase.from("whatsapp_sessions").select("client_id").eq("key_name", "creds");
   if (error) { console.error("Restore error:", error.message); return; }
   if (data?.length) {
     const ids = [...new Set(data.map(r => r.client_id))];
-    console.log(`Restoring ${ids.length} session(s):`, ids);
     for (const id of ids) startClient(id).catch(console.error);
   }
 }
@@ -359,7 +342,7 @@ app.get("/qr/:clientId", async (req, res) => {
 
 app.post("/request-code", async (req, res) => {
   const { clientId, phoneNumber } = req.body || {};
-  if (!clientId || !phoneNumber) return res.status(400).json({ error: "clientId and phoneNumber are required" });
+  if (!clientId || !phoneNumber) return res.status(400).json({ error: "clientId and phoneNumber required" });
   const digits = phoneNumber.replace(/[^0-9]/g, "");
   let client = clients.get(clientId);
   if (!client || (client.status === "disconnected" && !client.starting)) {
@@ -383,7 +366,7 @@ app.post("/request-code", async (req, res) => {
 
 app.post("/send", async (req, res) => {
   const { clientId, phone, message } = req.body || {};
-  if (!clientId || !phone || !message) return res.status(400).json({ error: "clientId, phone, and message are required" });
+  if (!clientId || !phone || !message) return res.status(400).json({ error: "clientId, phone, message required" });
   const client = clients.get(clientId);
   if (!client || client.status !== "connected") return res.status(503).json({ error: "Not connected" });
   try {
@@ -396,7 +379,6 @@ app.post("/send", async (req, res) => {
   }
 });
 
-// Send order confirmation — full flow
 app.post("/send-confirmation", async (req, res) => {
   const { clientId, phone, orderId, orderNo, name, items, subtotal, address, city } = req.body || {};
   if (!clientId || !phone || !orderId) return res.status(400).json({ error: "clientId, phone, orderId required" });
@@ -414,7 +396,6 @@ app.post("/send-confirmation", async (req, res) => {
   }
 });
 
-// Test route
 app.post("/test-list", async (req, res) => {
   const { clientId, phone } = req.body || {};
   const client = clients.get(clientId);
@@ -459,8 +440,6 @@ app.post("/disconnect/:clientId", async (req, res) => {
   await deleteSession(clientId);
   res.json({ success: true, clientId });
 });
-
-// ─── Start ───────────────────────────────────────────────────────────────────
 
 app.listen(PORT, () => {
   console.log(`WhatsApp multi-client server running on port ${PORT}`);
