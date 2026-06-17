@@ -35,6 +35,8 @@ const silentLogger = {
 
 const clients = new Map();
 
+// ─── Supabase Auth State ────────────────────────────────────────────────────
+
 async function useSupabaseAuthState(clientId) {
   const writeData = async (key, data) => {
     const id = `${clientId}:${key}`;
@@ -96,8 +98,83 @@ async function useSupabaseAuthState(clientId) {
 
 async function deleteSession(clientId) {
   const { error } = await supabase.from("whatsapp_sessions").delete().eq("client_id", clientId);
-  if (error) console.error(`[${clientId}] Supabase SESSION DELETE ERROR:`, error.message);
+  if (error) console.error(`[${clientId}] SESSION DELETE ERROR:`, error.message);
 }
+
+// ─── Order confirmation flow state ─────────────────────────────────────────
+// phone -> { orderId, orderNo, stage: 'confirm' | 'discount', clientId }
+const pendingOrders = new Map();
+
+// ─── Send order confirmation ────────────────────────────────────────────────
+
+async function sendOrderConfirmation(sock, jid, order) {
+  const { orderNo, name, items, subtotal, address, city } = order;
+  try {
+    await sock.sendMessage(jid, {
+      listMessage: {
+        title: "📦 Order Confirmation",
+        text: `Thank you for your order from Dewarekhas.pk. This is a confirmation message.\n\nOrder Details:\n\nOrder Number: #${orderNo}\nItems: ${items}\nSubtotal: ${subtotal}\n\nAddress: ${address}\nCity: ${city}\n\nPlease confirm your order.`,
+        footerText: "DewareKhas.pk",
+        buttonText: "Select one",
+        sections: [{
+          rows: [
+            { title: "✅ Yes, Confirm ✅", rowId: "confirm" },
+            { title: "❌ No, Cancel ❌", rowId: "cancel" },
+          ]
+        }]
+      }
+    });
+  } catch (e) {
+    // listMessage failed — fallback to text + poll
+    console.log(`[listMessage failed] Falling back to poll`);
+    await sock.sendMessage(jid, {
+      text: `📦 *Order Confirmation*\n\nThank you for your order from *Dewarekhas.pk*.\n\nOrder Number: *#${orderNo}*\nItems: ${items}\nSubtotal: ${subtotal}\nAddress: ${address}, ${city}\n\nPlease confirm your order.`
+    });
+    await new Promise(r => setTimeout(r, 800));
+    await sock.sendMessage(jid, {
+      poll: {
+        name: "Please confirm your order:",
+        values: ["✅ Yes, Confirm ✅", "❌ No, Cancel ❌"],
+        selectableCount: 1,
+      }
+    });
+  }
+}
+
+async function sendDiscountOffer(sock, jid, order) {
+  const { orderNo, subtotal } = order;
+  const discountedPrice = Math.round(Number(subtotal) * 0.9);
+  try {
+    await sock.sendMessage(jid, {
+      listMessage: {
+        title: "🎁 Special Discount Offer!",
+        text: `Aapka order cancel karne se pehle — hum aapko *10% discount* offer karte hain!\n\nOrder: #${orderNo}\nOriginal Price: Rs. ${subtotal}\nDiscounted Price: *Rs. ${discountedPrice}*\n\nKya aap discount ke saath confirm karna chahte hain?`,
+        footerText: "DewareKhas.pk",
+        buttonText: "Select one",
+        sections: [{
+          rows: [
+            { title: "✅ Yes, 10% Discount Ke Saath Confirm", rowId: "discount_confirm" },
+            { title: "❌ No, Cancel Karo", rowId: "discount_cancel" },
+          ]
+        }]
+      }
+    });
+  } catch (e) {
+    await sock.sendMessage(jid, {
+      text: `🎁 *Special Discount Offer!*\n\nAapka order cancel karne se pehle — hum aapko *10% discount* offer karte hain!\n\nOrder: *#${orderNo}*\nOriginal Price: Rs. ${subtotal}\nDiscounted Price: *Rs. ${discountedPrice}*`
+    });
+    await new Promise(r => setTimeout(r, 800));
+    await sock.sendMessage(jid, {
+      poll: {
+        name: "Discount ke saath confirm karein?",
+        values: ["✅ Yes, 10% Discount Ke Saath Confirm", "❌ No, Cancel Karo"],
+        selectableCount: 1,
+      }
+    });
+  }
+}
+
+// ─── WhatsApp Client ────────────────────────────────────────────────────────
 
 async function startClient(clientId) {
   const existing = clients.get(clientId);
@@ -158,7 +235,6 @@ async function startClient(clientId) {
         if (loggedOut) {
           await deleteSession(clientId);
           clients.delete(clientId);
-          console.log(`[${clientId}] Session deleted — fresh QR needed`);
         } else if (client?.shouldReconnect && !client.reconnectTimer) {
           client.reconnectTimer = setTimeout(() => {
             const c = clients.get(clientId);
@@ -169,21 +245,76 @@ async function startClient(clientId) {
       }
     });
 
-    // Listen for incoming messages (replies)
-    sock.ev.on("messages.upsert", async ({ messages }) => {
+    // ─── Incoming message handler ───────────────────────────────────────
+    sock.ev.on("messages.upsert", async ({ messages, type }) => {
+      if (type !== "notify") return;
       for (const msg of messages) {
         if (msg.key.fromMe) continue;
-        const text = msg.message?.conversation || msg.message?.extendedTextMessage?.text || "";
-        const from = msg.key.remoteJid;
-        console.log(`[${clientId}] Message from ${from}: ${text}`);
-        // Store reply in Supabase for ERP to read
-        if (text === "1" || text === "2" || text === "3") {
-          await supabase.from("whatsapp_replies").upsert({
-            client_id: clientId,
-            phone: from.replace("@s.whatsapp.net", ""),
-            reply: text,
-            received_at: new Date().toISOString(),
-          }, { onConflict: "client_id,phone" });
+        const jid = msg.key.remoteJid;
+        const phone = jid.replace("@s.whatsapp.net", "");
+
+        // List response
+        const listReply = msg.message?.listResponseMessage?.singleSelectReply?.selectedRowId;
+        // Poll response
+        const pollVote = msg.message?.pollUpdateMessage;
+
+        const response = listReply || (pollVote ? "poll" : null);
+        const pending = pendingOrders.get(phone);
+
+        if (!pending || pending.clientId !== clientId) continue;
+
+        if (pending.stage === "confirm") {
+          if (listReply === "confirm") {
+            // Confirmed
+            pendingOrders.delete(phone);
+            await sock.sendMessage(jid, {
+              text: `✅ *Shukriya!* Aapka order *#${pending.orderNo}* confirm ho gaya hai!\n\nHum jald hi aapka order dispatch karenge. 🚀\n\n_DewareKhas.pk_`
+            });
+            // Update Supabase
+            await supabase.from("order_statuses").upsert(
+              { order_id: String(pending.orderId), status: "Approved", updated_at: new Date().toISOString() },
+              { onConflict: "order_id" }
+            );
+            console.log(`[${clientId}] Order ${pending.orderNo} CONFIRMED`);
+          } else if (listReply === "cancel") {
+            // Offer discount
+            pending.stage = "discount";
+            pendingOrders.set(phone, pending);
+            await sendDiscountOffer(sock, jid, pending);
+          }
+        } else if (pending.stage === "discount") {
+          if (listReply === "discount_confirm") {
+            // Confirmed with discount
+            pendingOrders.delete(phone);
+            const discountedPrice = Math.round(Number(pending.subtotal) * 0.9);
+            const discountAmount = Number(pending.subtotal) - discountedPrice;
+            await sock.sendMessage(jid, {
+              text: `🎉 *Zabardast!* Aapka order *#${pending.orderNo}* 10% discount ke saath confirm ho gaya!\n\nDiscount: Rs. ${discountAmount}\nFinal Price: *Rs. ${discountedPrice}*\n\nHum jald dispatch karenge! 🚀\n\n_DewareKhas.pk_`
+            });
+            // Update Supabase — Approved + discount
+            await supabase.from("order_statuses").upsert(
+              {
+                order_id: String(pending.orderId),
+                status: "Approved",
+                discount: String(discountAmount),
+                updated_at: new Date().toISOString()
+              },
+              { onConflict: "order_id" }
+            );
+            console.log(`[${clientId}] Order ${pending.orderNo} CONFIRMED with 10% discount`);
+          } else if (listReply === "discount_cancel") {
+            // Cancelled
+            pendingOrders.delete(phone);
+            await sock.sendMessage(jid, {
+              text: `😔 Aapka order *#${pending.orderNo}* cancel ho gaya hai.\n\nAgar kabhi zaroorat ho to dobara order karein.\n\n_DewareKhas.pk_`
+            });
+            // Update Supabase
+            await supabase.from("order_statuses").upsert(
+              { order_id: String(pending.orderId), status: "Cancelled", updated_at: new Date().toISOString() },
+              { onConflict: "order_id" }
+            );
+            console.log(`[${clientId}] Order ${pending.orderNo} CANCELLED`);
+          }
         }
       }
     });
@@ -196,17 +327,19 @@ async function startClient(clientId) {
   }
 }
 
+// ─── Auto-restore sessions ───────────────────────────────────────────────────
+
 async function restoreSessions() {
   const { data, error } = await supabase.from("whatsapp_sessions").select("client_id").eq("key_name", "creds");
-  if (error) { console.error("Restore sessions error:", error.message); return; }
+  if (error) { console.error("Restore error:", error.message); return; }
   if (data?.length) {
     const ids = [...new Set(data.map(r => r.client_id))];
     console.log(`Restoring ${ids.length} session(s):`, ids);
     for (const id of ids) startClient(id).catch(console.error);
-  } else {
-    console.log("No saved sessions found");
   }
 }
+
+// ─── Routes ─────────────────────────────────────────────────────────────────
 
 app.get("/qr/:clientId", async (req, res) => {
   const { clientId } = req.params;
@@ -221,7 +354,7 @@ app.get("/qr/:clientId", async (req, res) => {
     if (c?.status === "connected") return res.json({ status: "connected" });
     if (c?.qrDataUrl) return res.json({ status: "qr", qr: c.qrDataUrl });
   }
-  res.json({ status: "pending", message: "QR not ready yet — try again" });
+  res.json({ status: "pending", message: "QR not ready yet" });
 });
 
 app.post("/request-code", async (req, res) => {
@@ -252,31 +385,55 @@ app.post("/send", async (req, res) => {
   const { clientId, phone, message } = req.body || {};
   if (!clientId || !phone || !message) return res.status(400).json({ error: "clientId, phone, and message are required" });
   const client = clients.get(clientId);
-  if (!client || client.status !== "connected") return res.status(503).json({ error: "Client not connected", status: client?.status || "not_found" });
+  if (!client || client.status !== "connected") return res.status(503).json({ error: "Not connected" });
   try {
     const digits = phone.replace(/[^0-9]/g, "");
     const jid = `${digits}@s.whatsapp.net`;
     await client.sock.sendMessage(jid, { text: message });
-    res.json({ success: true, to: jid });
+    res.json({ success: true });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-app.post("/test-list", async (req, res) => {
-  const { clientId, phone } = req.body || {};
+// Send order confirmation — full flow
+app.post("/send-confirmation", async (req, res) => {
+  const { clientId, phone, orderId, orderNo, name, items, subtotal, address, city } = req.body || {};
+  if (!clientId || !phone || !orderId) return res.status(400).json({ error: "clientId, phone, orderId required" });
   const client = clients.get(clientId);
-  if (!client || client.status !== "connected") return res.status(503).json({ error: "Not connected", status: client?.status || "not_found" });
+  if (!client || client.status !== "connected") return res.status(503).json({ error: "Not connected" });
   try {
     const digits = phone.replace(/[^0-9]/g, "");
     const jid = `${digits}@s.whatsapp.net`;
-    await client.sock.sendMessage(jid, {
-      poll: {
-        name: "📦 Order #DWK1237 Confirm karein",
-        values: ["✅ Yes, Confirm", "❌ No, Cancel", "🎁 10% Discount Le Aur Confirm"],
-        selectableCount: 1,
-      }
-    });
+    const order = { orderId, orderNo, name, items, subtotal, address, city, clientId };
+    pendingOrders.set(digits, { ...order, stage: "confirm" });
+    await sendOrderConfirmation(client.sock, jid, order);
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Test route
+app.post("/test-list", async (req, res) => {
+  const { clientId, phone } = req.body || {};
+  const client = clients.get(clientId);
+  if (!client || client.status !== "connected") return res.status(503).json({ error: "Not connected" });
+  try {
+    const digits = phone.replace(/[^0-9]/g, "");
+    const jid = `${digits}@s.whatsapp.net`;
+    const order = {
+      orderId: "test123",
+      orderNo: "DWK1237",
+      name: "Test Customer",
+      items: "Islamic Wall Frame × 1",
+      subtotal: "3299",
+      address: "Office no s8 distic council plaza chakwal",
+      city: "Chakwal",
+      clientId,
+    };
+    pendingOrders.set(digits, { ...order, stage: "confirm" });
+    await sendOrderConfirmation(client.sock, jid, order);
     res.json({ success: true });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -302,6 +459,8 @@ app.post("/disconnect/:clientId", async (req, res) => {
   await deleteSession(clientId);
   res.json({ success: true, clientId });
 });
+
+// ─── Start ───────────────────────────────────────────────────────────────────
 
 app.listen(PORT, () => {
   console.log(`WhatsApp multi-client server running on port ${PORT}`);
