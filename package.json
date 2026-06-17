@@ -12,6 +12,7 @@
   "license": "ISC",
   "type": "commonjs",
   "dependencies": {
+    "@supabase/supabase-js": "^2.108.2",
     "@whiskeysockets/baileys": "^7.0.0-rc13",
     "express": "^5.2.1",
     "qrcode": "^1.5.4"
