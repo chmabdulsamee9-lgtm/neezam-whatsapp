@@ -34,6 +34,7 @@ const silentLogger = {
 };
 
 const clients = new Map();
+const pendingOrders = new Map();
 
 // ─── Supabase Auth State ────────────────────────────────────────────────────
 
@@ -100,15 +101,11 @@ async function deleteSession(clientId) {
   await supabase.from("whatsapp_sessions").delete().eq("client_id", clientId);
 }
 
-// ─── Pending orders state ───────────────────────────────────────────────────
-const pendingOrders = new Map();
-
-// ─── Send confirmation message ──────────────────────────────────────────────
+// ─── Message helpers ────────────────────────────────────────────────────────
 
 async function sendOrderConfirmation(sock, jid, order) {
-  const { orderNo, name, items, subtotal, address, city } = order;
+  const { orderNo, items, subtotal, address, city } = order;
   const text = `📦 *Order Confirmation*\n\nThank you for your order from *Dewarekhas.pk*. This is a confirmation message.\n\nOrder Details:\n\nOrder Number: *#${orderNo}*\nItems: ${items}\nSubtotal: ${subtotal}\n\nAddress: ${address}\nCity: ${city}\n\nPlease confirm your order.`;
-
   await sock.sendMessage(jid, {
     poll: {
       name: text,
@@ -123,7 +120,6 @@ async function sendDiscountOffer(sock, jid, order) {
   const discountedPrice = Math.round(Number(subtotal) * 0.9);
   const discountAmount = Number(subtotal) - discountedPrice;
   const text = `🎁 *Special Discount Offer!*\n\nAapka order cancel karne se pehle — hum aapko *10% discount* offer karte hain!\n\nOrder: *#${orderNo}*\nOriginal Price: Rs. ${subtotal}\nDiscount: Rs. ${discountAmount}\nDiscounted Price: *Rs. ${discountedPrice}*\n\nKya aap discount ke saath confirm karna chahte hain?`;
-
   await sock.sendMessage(jid, {
     poll: {
       name: text,
@@ -131,18 +127,6 @@ async function sendDiscountOffer(sock, jid, order) {
       selectableCount: 1,
     }
   });
-}
-
-// ─── Poll vote detection ────────────────────────────────────────────────────
-
-function getPollVote(msg) {
-  try {
-    const pollUpdate = msg.message?.pollUpdateMessage;
-    if (!pollUpdate) return null;
-    const votes = pollUpdate.vote?.selectedOptions || [];
-    if (votes.length === 0) return null;
-    return votes[0]; // selected option name (hashed)
-  } catch { return null; }
 }
 
 // ─── WhatsApp Client ────────────────────────────────────────────────────────
@@ -160,8 +144,6 @@ async function startClient(clientId) {
   entry.qrDataUrl = null;
   entry.shouldReconnect = true;
   entry.reconnectTimer = null;
-  // Store poll name->options map for decoding votes
-  entry.pollCache = entry.pollCache || new Map();
   clients.set(clientId, entry);
 
   try {
@@ -171,12 +153,7 @@ async function startClient(clientId) {
 
     const sock = makeWASocket({
       version, auth: state, printQRInTerminal: false, logger: silentLogger,
-      getMessage: async (key) => {
-        // Return cached poll message for vote decryption
-        const cached = entry.pollCache?.get(key.id);
-        if (cached) return cached;
-        return { conversation: '' };
-      },
+      getMessage: async () => { return { conversation: '' }; },
       syncFullHistory: false, markOnlineOnConnect: false,
       connectTimeoutMs: 60000, keepAliveIntervalMs: 30000,
     });
@@ -221,83 +198,63 @@ async function startClient(clientId) {
       }
     });
 
-    // Cache sent poll messages for vote decryption
-    sock.ev.on("messages.upsert", async ({ messages, type }) => {
-      for (const msg of messages) {
-        // Cache our own poll messages
-        if (msg.key.fromMe && msg.message?.pollCreationMessage) {
-          entry.pollCache?.set(msg.key.id, msg.message);
-        }
+    // ─── Poll vote handler ───────────────────────────────────────────────
+    sock.ev.on("messages.update", async (updates) => {
+      for (const update of updates) {
+        if (!update.update?.pollUpdates) continue;
 
-        if (type !== "notify") continue;
-        if (msg.key.fromMe) continue;
-
-        const jid = msg.key.remoteJid;
+        const jid = update.key.remoteJid;
         const phone = jid.replace("@s.whatsapp.net", "");
         const pending = pendingOrders.get(phone);
         if (!pending || pending.clientId !== clientId) continue;
 
-        // Handle list response
-        const listReply = msg.message?.listResponseMessage?.singleSelectReply?.selectedRowId;
+        for (const pollUpdate of update.update.pollUpdates) {
+          const votes = pollUpdate.vote?.selectedOptions || [];
+          if (votes.length === 0) continue;
 
-        // Handle poll update — decode selected option
-        let pollChoice = null;
-        if (msg.message?.pollUpdateMessage) {
-          try {
-            const pollMsg = await sock.decryptPollVote(msg);
-            if (pollMsg?.selectedOptions?.length > 0) {
-              pollChoice = pollMsg.selectedOptions[0];
-              console.log(`[${clientId}] Poll vote from ${phone}: ${pollChoice}`);
+          const choice = votes[0];
+          console.log(`[${clientId}] Poll vote from ${phone}: ${choice} | stage: ${pending.stage}`);
+
+          if (pending.stage === "confirm") {
+            if (choice.toLowerCase().includes("yes") || choice.toLowerCase().includes("confirm")) {
+              pendingOrders.delete(phone);
+              await sock.sendMessage(jid, {
+                text: `✅ *Shukriya!* Aapka order *#${pending.orderNo}* confirm ho gaya!\n\nHum jald dispatch karenge. 🚀\n\n_DewareKhas.pk_`
+              });
+              await supabase.from("order_statuses").upsert(
+                { order_id: String(pending.orderId), status: "Approved", updated_at: new Date().toISOString() },
+                { onConflict: "order_id" }
+              );
+              console.log(`[${clientId}] Order ${pending.orderNo} CONFIRMED ✅`);
+            } else {
+              pending.stage = "discount";
+              pendingOrders.set(phone, pending);
+              await sendDiscountOffer(sock, jid, pending);
             }
-          } catch (e) {
-            console.error(`[${clientId}] Poll decrypt error:`, e.message);
-          }
-        }
-
-        const choice = listReply || pollChoice;
-        if (!choice) continue;
-
-        console.log(`[${clientId}] Response from ${phone}: ${choice} | stage: ${pending.stage}`);
-
-        if (pending.stage === "confirm") {
-          if (choice.toLowerCase().includes("yes") || choice.toLowerCase().includes("confirm")) {
-            pendingOrders.delete(phone);
-            await sock.sendMessage(jid, {
-              text: `✅ *Shukriya!* Aapka order *#${pending.orderNo}* confirm ho gaya hai!\n\nHum jald aapka order dispatch karenge. 🚀\n\n_DewareKhas.pk_`
-            });
-            await supabase.from("order_statuses").upsert(
-              { order_id: String(pending.orderId), status: "Approved", updated_at: new Date().toISOString() },
-              { onConflict: "order_id" }
-            );
-            console.log(`[${clientId}] Order ${pending.orderNo} CONFIRMED ✅`);
-          } else if (choice.toLowerCase().includes("cancel") || choice.toLowerCase().includes("no")) {
-            pending.stage = "discount";
-            pendingOrders.set(phone, pending);
-            await sendDiscountOffer(sock, jid, pending);
-          }
-        } else if (pending.stage === "discount") {
-          if (choice.toLowerCase().includes("yes") || choice.toLowerCase().includes("discount")) {
-            pendingOrders.delete(phone);
-            const discountedPrice = Math.round(Number(pending.subtotal) * 0.9);
-            const discountAmount = Number(pending.subtotal) - discountedPrice;
-            await sock.sendMessage(jid, {
-              text: `🎉 *Zabardast!* Aapka order *#${pending.orderNo}* 10% discount ke saath confirm ho gaya!\n\nDiscount: Rs. ${discountAmount}\nFinal Price: *Rs. ${discountedPrice}*\n\nHum jald dispatch karenge! 🚀\n\n_DewareKhas.pk_`
-            });
-            await supabase.from("order_statuses").upsert(
-              { order_id: String(pending.orderId), status: "Approved", discount: String(discountAmount), updated_at: new Date().toISOString() },
-              { onConflict: "order_id" }
-            );
-            console.log(`[${clientId}] Order ${pending.orderNo} CONFIRMED with discount ✅`);
-          } else {
-            pendingOrders.delete(phone);
-            await sock.sendMessage(jid, {
-              text: `😔 Aapka order *#${pending.orderNo}* cancel ho gaya hai.\n\nAgar kabhi zaroorat ho to dobara order karein.\n\n_DewareKhas.pk_`
-            });
-            await supabase.from("order_statuses").upsert(
-              { order_id: String(pending.orderId), status: "Cancelled", updated_at: new Date().toISOString() },
-              { onConflict: "order_id" }
-            );
-            console.log(`[${clientId}] Order ${pending.orderNo} CANCELLED ❌`);
+          } else if (pending.stage === "discount") {
+            if (choice.toLowerCase().includes("yes") || choice.toLowerCase().includes("discount")) {
+              pendingOrders.delete(phone);
+              const discountedPrice = Math.round(Number(pending.subtotal) * 0.9);
+              const discountAmount = Number(pending.subtotal) - discountedPrice;
+              await sock.sendMessage(jid, {
+                text: `🎉 *Zabardast!* Aapka order *#${pending.orderNo}* 10% discount ke saath confirm!\n\nDiscount: Rs. ${discountAmount}\nFinal Price: *Rs. ${discountedPrice}*\n\nHum jald dispatch karenge! 🚀\n\n_DewareKhas.pk_`
+              });
+              await supabase.from("order_statuses").upsert(
+                { order_id: String(pending.orderId), status: "Approved", discount: String(discountAmount), updated_at: new Date().toISOString() },
+                { onConflict: "order_id" }
+              );
+              console.log(`[${clientId}] Order ${pending.orderNo} CONFIRMED with discount ✅`);
+            } else {
+              pendingOrders.delete(phone);
+              await sock.sendMessage(jid, {
+                text: `😔 Aapka order *#${pending.orderNo}* cancel ho gaya.\n\nAgar kabhi zaroorat ho to dobara order karein.\n\n_DewareKhas.pk_`
+              });
+              await supabase.from("order_statuses").upsert(
+                { order_id: String(pending.orderId), status: "Cancelled", updated_at: new Date().toISOString() },
+                { onConflict: "order_id" }
+              );
+              console.log(`[${clientId}] Order ${pending.orderNo} CANCELLED ❌`);
+            }
           }
         }
       }
