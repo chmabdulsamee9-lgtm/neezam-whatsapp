@@ -3,16 +3,20 @@
 const express = require("express");
 const baileys = require("@whiskeysockets/baileys");
 const makeWASocket = baileys.default;
-const { useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion } = baileys;
+const { DisconnectReason, fetchLatestBaileysVersion, initAuthCreds, BufferJSON, proto } = baileys;
 const qrcode = require("qrcode");
-const path = require("path");
-const fs = require("fs");
+const { createClient } = require("@supabase/supabase-js");
+
+const SUPABASE_URL = "https://zrdmzmhogykhtrvjdqko.supabase.co";
+const SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InpyZG16bWhvZ3lraHRydmpkcWtvIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODA3MzY0MDksImV4cCI6MjA5NjMxMjQwOX0.gXBNEkD4q40fpc8zjQdh9GCgqJD4S8bpI2xUx2rcPEQ";
+
+const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
 
 const app = express();
 
 app.use((req, res, next) => {
   res.header('Access-Control-Allow-Origin', '*');
-  res.header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+  res.header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS, DELETE');
   res.header('Access-Control-Allow-Headers', 'Content-Type');
   if (req.method === 'OPTIONS') return res.sendStatus(200);
   next();
@@ -21,11 +25,7 @@ app.use((req, res, next) => {
 app.use(express.json());
 
 const PORT = process.env.PORT || 3001;
-const SESSIONS_DIR = path.join(__dirname, "sessions");
 
-if (!fs.existsSync(SESSIONS_DIR)) fs.mkdirSync(SESSIONS_DIR, { recursive: true });
-
-// Minimal silent logger so Baileys doesn't flood stdout
 const silentLogger = {
   level: "silent",
   trace: () => {}, debug: () => {}, info: () => {},
@@ -33,157 +33,226 @@ const silentLogger = {
   child: function () { return this; },
 };
 
-// clients: Map<clientId, { sock, status, qrDataUrl, shouldReconnect }>
 const clients = new Map();
 
-async function startClient(clientId) {
-  const sessionDir = path.join(SESSIONS_DIR, clientId);
-  if (!fs.existsSync(sessionDir)) fs.mkdirSync(sessionDir, { recursive: true });
+async function useSupabaseAuthState(clientId) {
+  const writeData = async (key, data) => {
+    const id = `${clientId}:${key}`;
+    const { error } = await supabase.from("whatsapp_sessions").upsert({
+      id, client_id: clientId, key_name: key,
+      data: JSON.parse(JSON.stringify(data, BufferJSON.replacer)),
+      updated_at: new Date().toISOString(),
+    });
+    if (error) console.error(`[${clientId}] Supabase WRITE ERROR (${key}):`, error.message);
+  };
 
-  const { state, saveCreds } = await useMultiFileAuthState(sessionDir);
+  const readData = async (key) => {
+    const id = `${clientId}:${key}`;
+    const { data: row, error } = await supabase.from("whatsapp_sessions").select("data").eq("id", id).maybeSingle();
+    if (error) console.error(`[${clientId}] Supabase READ ERROR (${key}):`, error.message);
+    if (!row?.data) return null;
+    return JSON.parse(JSON.stringify(row.data), BufferJSON.reviver);
+  };
 
-  let version;
-  try {
-    ({ version } = await fetchLatestBaileysVersion());
-  } catch {
-    version = [2, 3000, 1019291584]; // fallback version
-  }
+  const removeData = async (key) => {
+    const id = `${clientId}:${key}`;
+    const { error } = await supabase.from("whatsapp_sessions").delete().eq("id", id);
+    if (error) console.error(`[${clientId}] Supabase DELETE ERROR (${key}):`, error.message);
+  };
 
-  const sock = makeWASocket({
-    version,
-    auth: state,
-    printQRInTerminal: false,
-    logger: silentLogger,
-  });
+  const creds = (await readData("creds")) || initAuthCreds();
 
-  // Upsert the client entry
-  const existing = clients.get(clientId) || {};
-  existing.sock = sock;
-  existing.status = "connecting";
-  existing.qrDataUrl = null;
-  existing.shouldReconnect = true;
-  clients.set(clientId, existing);
-
-  sock.ev.on("creds.update", saveCreds);
-
-  sock.ev.on("connection.update", async (update) => {
-    const { connection, lastDisconnect, qr } = update;
-    const client = clients.get(clientId);
-
-    if (qr) {
-      try {
-        const dataUrl = await qrcode.toDataURL(qr);
-        if (client) { client.qrDataUrl = dataUrl; client.status = "qr"; }
-        console.log(`[${clientId}] QR ready`);
-      } catch (e) {
-        console.error(`[${clientId}] QR error:`, e.message);
-      }
-    }
-
-    if (connection === "open") {
-      if (client) { client.status = "connected"; client.qrDataUrl = null; }
-      console.log(`[${clientId}] Connected`);
-    }
-
-    if (connection === "close") {
-      const code = lastDisconnect?.error?.output?.statusCode;
-      const loggedOut = code === DisconnectReason.loggedOut;
-      console.log(`[${clientId}] Disconnected — code=${code} loggedOut=${loggedOut}`);
-
-      if (client) client.status = "disconnected";
-
-      if (!loggedOut && client?.shouldReconnect) {
-        console.log(`[${clientId}] Reconnecting in 3s...`);
-        setTimeout(() => startClient(clientId).catch(console.error), 3000);
-      } else {
-        clients.delete(clientId);
-      }
-    }
-  });
+  return {
+    state: {
+      creds,
+      keys: {
+        get: async (type, ids) => {
+          const data = {};
+          await Promise.all(ids.map(async (id) => {
+            let value = await readData(`${type}-${id}`);
+            if (type === "app-state-sync-key" && value) {
+              value = proto.Message.AppStateSyncKeyData.fromObject(value);
+            }
+            data[id] = value;
+          }));
+          return data;
+        },
+        set: async (data) => {
+          const tasks = [];
+          for (const category in data) {
+            for (const id in data[category]) {
+              const value = data[category][id];
+              const key = `${category}-${id}`;
+              tasks.push(value ? writeData(key, value) : removeData(key));
+            }
+          }
+          await Promise.all(tasks);
+        },
+      },
+    },
+    saveCreds: async () => { await writeData("creds", creds); },
+  };
 }
 
-// ─── Routes ─────────────────────────────────────────────────────────────────
+async function deleteSession(clientId) {
+  const { error } = await supabase.from("whatsapp_sessions").delete().eq("client_id", clientId);
+  if (error) console.error(`[${clientId}] Supabase SESSION DELETE ERROR:`, error.message);
+}
 
-// GET /qr/:clientId — start session, return QR dataURL or {status:'connected'}
+async function startClient(clientId) {
+  const existing = clients.get(clientId);
+  if (existing?.starting) { console.log(`[${clientId}] Already starting — skip`); return; }
+  if (existing?.status === "connected") { console.log(`[${clientId}] Already connected — skip`); return; }
+  if (existing?.sock) { try { existing.sock.end(); } catch {} }
+  if (existing?.reconnectTimer) { clearTimeout(existing.reconnectTimer); }
+
+  const entry = existing || {};
+  entry.starting = true;
+  entry.status = "connecting";
+  entry.qrDataUrl = null;
+  entry.shouldReconnect = true;
+  entry.reconnectTimer = null;
+  clients.set(clientId, entry);
+
+  try {
+    const { state, saveCreds } = await useSupabaseAuthState(clientId);
+    let version;
+    try { ({ version } = await fetchLatestBaileysVersion()); } catch { version = [2, 3000, 1019291584]; }
+
+    const sock = makeWASocket({
+      version, auth: state, printQRInTerminal: false, logger: silentLogger,
+      getMessage: async () => { return { conversation: '' }; },
+      syncFullHistory: false, markOnlineOnConnect: false,
+      connectTimeoutMs: 60000, keepAliveIntervalMs: 30000,
+    });
+
+    entry.sock = sock;
+    entry.starting = false;
+
+    sock.ev.on("creds.update", saveCreds);
+
+    sock.ev.on("connection.update", async (update) => {
+      const { connection, lastDisconnect, qr } = update;
+      const client = clients.get(clientId);
+      if (client?.sock !== sock) return;
+
+      if (qr) {
+        try {
+          const dataUrl = await qrcode.toDataURL(qr);
+          if (client) { client.qrDataUrl = dataUrl; client.status = "qr"; }
+          console.log(`[${clientId}] QR ready`);
+        } catch (e) { console.error(`[${clientId}] QR error:`, e.message); }
+      }
+
+      if (connection === "open") {
+        if (client) { client.status = "connected"; client.qrDataUrl = null; }
+        console.log(`[${clientId}] Connected ✅`);
+      }
+
+      if (connection === "close") {
+        const code = lastDisconnect?.error?.output?.statusCode;
+        const loggedOut = code === DisconnectReason.loggedOut;
+        console.log(`[${clientId}] Disconnected — code=${code} loggedOut=${loggedOut}`);
+        if (client) client.status = "disconnected";
+
+        if (loggedOut) {
+          await deleteSession(clientId);
+          clients.delete(clientId);
+          console.log(`[${clientId}] Session deleted — fresh QR needed`);
+        } else if (client?.shouldReconnect && !client.reconnectTimer) {
+          client.reconnectTimer = setTimeout(() => {
+            const c = clients.get(clientId);
+            if (c) c.reconnectTimer = null;
+            startClient(clientId).catch(console.error);
+          }, 5000);
+        }
+      }
+    });
+
+    // Listen for incoming messages (replies)
+    sock.ev.on("messages.upsert", async ({ messages }) => {
+      for (const msg of messages) {
+        if (msg.key.fromMe) continue;
+        const text = msg.message?.conversation || msg.message?.extendedTextMessage?.text || "";
+        const from = msg.key.remoteJid;
+        console.log(`[${clientId}] Message from ${from}: ${text}`);
+        // Store reply in Supabase for ERP to read
+        if (text === "1" || text === "2" || text === "3") {
+          await supabase.from("whatsapp_replies").upsert({
+            client_id: clientId,
+            phone: from.replace("@s.whatsapp.net", ""),
+            reply: text,
+            received_at: new Date().toISOString(),
+          }, { onConflict: "client_id,phone" });
+        }
+      }
+    });
+
+  } catch (err) {
+    entry.starting = false;
+    entry.status = "disconnected";
+    console.error(`[${clientId}] startClient error:`, err.message);
+    throw err;
+  }
+}
+
+async function restoreSessions() {
+  const { data, error } = await supabase.from("whatsapp_sessions").select("client_id").eq("key_name", "creds");
+  if (error) { console.error("Restore sessions error:", error.message); return; }
+  if (data?.length) {
+    const ids = [...new Set(data.map(r => r.client_id))];
+    console.log(`Restoring ${ids.length} session(s):`, ids);
+    for (const id of ids) startClient(id).catch(console.error);
+  } else {
+    console.log("No saved sessions found");
+  }
+}
+
 app.get("/qr/:clientId", async (req, res) => {
   const { clientId } = req.params;
   const existing = clients.get(clientId);
-
-  if (existing?.status === "connected") {
-    return res.json({ status: "connected" });
-  }
-
-  // Start a new session if none is running
-  if (!existing || existing.status === "disconnected") {
+  if (existing?.status === "connected") return res.json({ status: "connected" });
+  if (!existing || (existing.status === "disconnected" && !existing.starting && !existing.reconnectTimer)) {
     startClient(clientId).catch(console.error);
   }
-
-  // Poll up to 10 seconds for QR or connected state
   for (let i = 0; i < 20; i++) {
     await new Promise((r) => setTimeout(r, 500));
     const c = clients.get(clientId);
     if (c?.status === "connected") return res.json({ status: "connected" });
     if (c?.qrDataUrl) return res.json({ status: "qr", qr: c.qrDataUrl });
   }
-
-  res.json({ status: "pending", message: "QR not ready yet — try again in a moment" });
+  res.json({ status: "pending", message: "QR not ready yet — try again" });
 });
 
-// POST /request-code — { clientId, phoneNumber } — phone number pairing
 app.post("/request-code", async (req, res) => {
   const { clientId, phoneNumber } = req.body || {};
-  if (!clientId || !phoneNumber) {
-    return res.status(400).json({ error: "clientId and phoneNumber are required" });
-  }
-
+  if (!clientId || !phoneNumber) return res.status(400).json({ error: "clientId and phoneNumber are required" });
   const digits = phoneNumber.replace(/[^0-9]/g, "");
-
-  // Start session if not already running
   let client = clients.get(clientId);
-  if (!client || client.status === "disconnected") {
+  if (!client || (client.status === "disconnected" && !client.starting)) {
     await startClient(clientId);
-    // Wait for socket to be ready (up to 8s)
     for (let i = 0; i < 16; i++) {
       await new Promise((r) => setTimeout(r, 500));
       client = clients.get(clientId);
       if (client?.sock) break;
     }
   }
-
   client = clients.get(clientId);
-  if (!client?.sock) {
-    return res.status(503).json({ error: "Session could not be started" });
-  }
-
-  if (client.status === "connected") {
-    return res.json({ status: "connected" });
-  }
-
+  if (!client?.sock) return res.status(503).json({ error: "Session could not be started" });
+  if (client.status === "connected") return res.json({ status: "connected" });
   try {
     const code = await client.sock.requestPairingCode(digits);
-    console.log(`[${clientId}] Pairing code for ${digits}: ${code}`);
     res.json({ code });
   } catch (err) {
-    console.error(`[${clientId}] requestPairingCode error:`, err.message);
     res.status(500).json({ error: err.message });
   }
 });
 
-// POST /send — { clientId, phone, message }
 app.post("/send", async (req, res) => {
   const { clientId, phone, message } = req.body || {};
-  if (!clientId || !phone || !message) {
-    return res.status(400).json({ error: "clientId, phone, and message are required" });
-  }
-
+  if (!clientId || !phone || !message) return res.status(400).json({ error: "clientId, phone, and message are required" });
   const client = clients.get(clientId);
-  if (!client || client.status !== "connected") {
-    return res.status(503).json({
-      error: "Client not connected",
-      status: client?.status || "not_found",
-    });
-  }
-
+  if (!client || client.status !== "connected") return res.status(503).json({ error: "Client not connected", status: client?.status || "not_found" });
   try {
     const digits = phone.replace(/[^0-9]/g, "");
     const jid = `${digits}@s.whatsapp.net`;
@@ -194,7 +263,26 @@ app.post("/send", async (req, res) => {
   }
 });
 
-// GET /status/:clientId
+app.post("/test-list", async (req, res) => {
+  const { clientId, phone } = req.body || {};
+  const client = clients.get(clientId);
+  if (!client || client.status !== "connected") return res.status(503).json({ error: "Not connected", status: client?.status || "not_found" });
+  try {
+    const digits = phone.replace(/[^0-9]/g, "");
+    const jid = `${digits}@s.whatsapp.net`;
+    await client.sock.sendMessage(jid, {
+      poll: {
+        name: "📦 Order #DWK1237 Confirm karein",
+        values: ["✅ Yes, Confirm", "❌ No, Cancel", "🎁 10% Discount Le Aur Confirm"],
+        selectableCount: 1,
+      }
+    });
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 app.get("/status/:clientId", (req, res) => {
   const { clientId } = req.params;
   const client = clients.get(clientId);
@@ -202,33 +290,20 @@ app.get("/status/:clientId", (req, res) => {
   res.json({ status: client.status, clientId });
 });
 
-// POST /disconnect/:clientId — logout and delete session
 app.post("/disconnect/:clientId", async (req, res) => {
   const { clientId } = req.params;
   const client = clients.get(clientId);
-
-  if (!client) return res.json({ success: true, message: "Session not found" });
-
-  client.shouldReconnect = false;
-
-  try {
-    await client.sock.logout();
-  } catch {
-    // logout may throw if already disconnected; that's fine
+  if (client) {
+    client.shouldReconnect = false;
+    if (client.reconnectTimer) clearTimeout(client.reconnectTimer);
+    try { await client.sock.logout(); } catch {}
+    clients.delete(clientId);
   }
-
-  const sessionDir = path.join(SESSIONS_DIR, clientId);
-  if (fs.existsSync(sessionDir)) {
-    fs.rmSync(sessionDir, { recursive: true, force: true });
-  }
-
-  clients.delete(clientId);
-  console.log(`[${clientId}] Logged out and session deleted`);
+  await deleteSession(clientId);
   res.json({ success: true, clientId });
 });
 
-// ─── Start ───────────────────────────────────────────────────────────────────
-
 app.listen(PORT, () => {
   console.log(`WhatsApp multi-client server running on port ${PORT}`);
+  restoreSessions().catch(console.error);
 });
